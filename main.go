@@ -18,6 +18,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 //
@@ -105,7 +107,7 @@ func loadConfig() Config {
 		RefreshInterval: refreshDuration,
 		CountryCode:     resolve("COUNTRY_CODE", *countryFlag, "IS"),
 		RIPEURL:         resolve("RIPE_URL", *ripeURLFlag, "https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-latest"),
-		//RIPEURL: resolve("RIPE_URL", *ripeURLFlag, "http://localhost/idontexist"),
+		//RIPEURL: resolve("RIPE_URL", *ripeURLFlag, "http://localhost:9187/delegated-ripencc-latest"),
 	}
 }
 
@@ -287,18 +289,28 @@ func loadFromDisk(path string) ([]byte, error) {
 }
 
 func startPeriodicRefresh(config Config) {
+	tick := make(chan struct{})
+	limiter := rate.NewLimiter(rate.Every(config.RefreshInterval), 1)
+
 	go func() {
 		for {
-			yamlData, err := refreshAndStore(config)
-			if err != nil {
-				log.Printf("Refresh error: %v", err)
-			} else {
-				yamlContent.Store(yamlData)
-				log.Printf("YAML updated (%d bytes)", len(yamlData))
+			if err := limiter.Wait(context.Background()); err != nil {
+				log.Println("Rate limiter error:", err)
+				continue
 			}
-			time.Sleep(config.RefreshInterval)
+			tick <- struct{}{}
 		}
 	}()
+
+	for range tick {
+		yamlData, err := refreshAndStore(config)
+		if err != nil {
+			log.Printf("Refresh error: %v", err)
+		} else {
+			yamlContent.Store(yamlData)
+			log.Printf("YAML updated (%d bytes)", len(yamlData))
+		}
+	}
 }
 
 //
@@ -356,13 +368,7 @@ func serveYAML(addr string) error {
 func main() {
 	config := loadConfig()
 
-	yamlData, err := refreshAndStore(config)
-	if err != nil {
-		log.Fatalf("initial load failed: %v", err)
-	}
-	yamlContent.Store(yamlData)
-
-	startPeriodicRefresh(config)
+	go startPeriodicRefresh(config)
 
 	if err := serveYAML(config.ListenAddr); err != nil {
 		log.Fatalf("server error: %v", err)
